@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/api/v1"
@@ -23,12 +27,17 @@ type Config struct {
 	Password         string
 	Repository       string
 	KubeConfig       kubeConfigFlags
+	MinExpiry        int
+	RegexPattern     string
+	DeleteImages     bool
 }
 
 // Image represents a docker image in registry
 type Image struct {
 	Name          string
 	Tag           string
+	Digest        string
+	Created       time.Time
 	UsedInCluster bool
 
 	sync.RWMutex
@@ -42,6 +51,7 @@ var Cfg = &Config{}
 const (
 	registryTokenURL = "%s/jwt/auth?client_id=docker&offline_token=true&service=container_registry&scope=repository:%s:*"
 	imageTagsURL     = "%s/v2/%s/tags/list"
+	manifestURL      = "%s/v2/%s/manifests/%s"
 )
 
 func main() {
@@ -51,6 +61,9 @@ func main() {
 	flag.StringVar(&Cfg.Password, "password", "", "Password used to access repository")
 	flag.StringVar(&Cfg.Repository, "repository", "", "Lookup this specific repository. Include group if repo is in a group.")
 	flag.Var(&Cfg.KubeConfig, "kubeconfig", "absolute path to the kubeconfig file")
+	flag.IntVar(&Cfg.MinExpiry, "minexpiry", 7, "Minimum age for images in days which shall be removed")
+	flag.StringVar(&Cfg.RegexPattern, "regexp", "", "Regex pattern which must NOT match with the image tag")
+	flag.BoolVar(&Cfg.DeleteImages, "delete", false, "If true, will delete all found images")
 	flag.Parse()
 
 	// Parse registry url (remove protocol)
@@ -63,9 +76,43 @@ func main() {
 	// --- Get all image tags from the repository ---
 	images := getImages(token)
 
-	// --- Print out found tags ---
+	// --- Set the time when the image was created ---
+	setImageUploadDate(token, images)
+
+	// --- Remove images from the slice which are too young ---
+	// Calculate min expiry date
+	minExpiryDate := time.Now().AddDate(0, 0, Cfg.MinExpiry*-1)
+
+	// Remove images
+	i := 0
 	for _, image := range images {
-		fmt.Printf("Tag found: %s:%s\n", image.Name, image.Tag)
+		if image.Created.Before(minExpiryDate) {
+			// This image should stay in slice
+			images[i] = image
+			i++
+		} else {
+			// Print information
+			fmt.Printf("Image %s:%s is too young, skipped: %s\n", image.Name, image.Tag, image.Created.String())
+		}
+	}
+	// Remove the rest
+	images = images[:i]
+
+	// --- Remove images which does not match the regex pattern if provided ---
+	if Cfg.RegexPattern != "" {
+		i = 0
+		for _, image := range images {
+			if matched, _ := regexp.MatchString(Cfg.RegexPattern, image.Tag); !matched {
+				// This image should stay in slice
+				images[i] = image
+				i++
+			} else {
+				// Print information
+				fmt.Printf("Image %s:%s matches regexp, skipped: %s\n", image.Name, image.Tag, Cfg.RegexPattern)
+			}
+		}
+		// Remove the rest
+		images = images[:i]
 	}
 
 	// --- Look up images in kubernetes clusters ---
@@ -82,9 +129,30 @@ func main() {
 	// --- Print resulting images ---
 	for _, image := range images {
 		if !image.UsedInCluster {
-			fmt.Printf("Image not used in cluster: %s:%s\n", image.Name, image.Tag)
+			fmt.Printf("Image will be deleted: %s:%s\n", image.Name, image.Tag)
 		}
 	}
+
+	// --- Give the user the chance to think about it ---
+	if Cfg.DeleteImages {
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Println("Do you really want to delete the images listed above? Please type yes if so...")
+		fmt.Printf("> ")
+		text, _ := reader.ReadString('\n')
+		if text != "yes\n" {
+			return
+		}
+
+		// Start delete process
+		fmt.Println("--- Starting delete process ---")
+
+		// Set image digest
+		setImageDigest(token, images)
+
+		// Delete images
+		deleteImages(images, token)
+	}
+
 }
 
 func setImagesClusterUsage(images []*Image, c string, wg *sync.WaitGroup) {
@@ -145,35 +213,74 @@ func setImagesClusterUsage(images []*Image, c string, wg *sync.WaitGroup) {
 	}
 }
 
+func deleteImages(images []*Image, token string) {
+	for _, image := range images {
+		// Create request
+		manifestURLParsed := fmt.Sprintf(manifestURL, Cfg.RegistryURL, Cfg.Repository, image.Digest)
+		sendHTTPRequest(manifestURLParsed, token, "DELETE", true)
+		fmt.Printf("Image deleted: %s:%s\n", image.Name, image.Tag)
+	}
+}
+
+func setImageDigest(token string, images []*Image) {
+	for id, image := range images {
+		// Create request
+		manifestURLParsed := fmt.Sprintf(manifestURL, Cfg.RegistryURL, Cfg.Repository, image.Tag)
+		body, resp := sendHTTPRequest(manifestURLParsed, token, "GET", true)
+
+		// Extract image tags from response
+		var data map[string]interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			panic(err)
+		}
+
+		// Get digest
+		images[id].Digest = resp.Header.Get("Docker-Content-Digest")
+	}
+}
+
+func setImageUploadDate(token string, images []*Image) {
+	for id, image := range images {
+		// Create request
+		manifestURLParsed := fmt.Sprintf(manifestURL, Cfg.RegistryURL, Cfg.Repository, image.Tag)
+		body, _ := sendHTTPRequest(manifestURLParsed, token, "GET", false)
+
+		// Extract image tags from response
+		var data map[string]interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			panic(err)
+		}
+
+		// Get history
+		history := data["history"].([]interface{})
+
+		// Get first history entry (always the newest) which is the last layer
+		lastLayer := history[0].(map[string]interface{})
+
+		// Get v1 Compatibility
+		compJSON := lastLayer["v1Compatibility"].(string)
+
+		// Get created field value
+		var comp map[string]interface{}
+		if err := json.Unmarshal([]byte(compJSON), &comp); err != nil {
+			panic(err)
+		}
+
+		// Parse time
+		t, err := time.Parse(time.RFC3339, comp["created"].(string))
+		if err != nil {
+			panic(err)
+		}
+
+		// Save time
+		images[id].Created = t
+	}
+}
+
 func getImages(token string) []*Image {
 	// Create request
 	listTagsURL := fmt.Sprintf(imageTagsURL, Cfg.RegistryURL, Cfg.Repository)
-	req, err := http.NewRequest("GET", listTagsURL, nil)
-	if err != nil {
-		panic(err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	cli := &http.Client{}
-
-	// Send request
-	resp, err := cli.Do(req)
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-
-	// Get response from body
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		panic(err)
-	}
-
-	// Validate response
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Return code: %d\n", resp.StatusCode)
-		fmt.Printf("Message: %s", string(body[:]))
-		panic("error")
-	}
+	body, _ := sendHTTPRequest(listTagsURL, token, "GET", false)
 
 	// Extract image tags from response
 	var data map[string]interface{}
@@ -229,6 +336,44 @@ func getRegistryToken() string {
 		panic(err)
 	}
 	return data["token"].(string)
+}
+
+func sendHTTPRequest(url, token, method string, h bool) ([]byte, *http.Response) {
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		panic(err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	if h {
+		req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	}
+	cli := &http.Client{}
+
+	// Send request
+	resp, err := cli.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+
+	// Get response from body
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	// Validate response
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		if resp.StatusCode == http.StatusNotFound {
+			fmt.Printf("Return code: %d\n", resp.StatusCode)
+		} else {
+			fmt.Printf("Return code: %d\n", resp.StatusCode)
+			fmt.Printf("Message: %s", string(body[:]))
+			panic("error")
+		}
+	}
+
+	return body, resp
 }
 
 func (k *kubeConfigFlags) Set(value string) error {
